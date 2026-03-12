@@ -1,6 +1,11 @@
 # Clean Backtest Package
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/snowballTQ/clean-backtest/blob/main/clean_backtest_colab.ipynb)
+
 This folder contains a cleaned and distributable version of the backtest code.
+
+- GitHub repository: `https://github.com/snowballTQ/clean-backtest`
+- Colab notebook: `https://colab.research.google.com/github/snowballTQ/clean-backtest/blob/main/clean_backtest_colab.ipynb`
 
 ## Files
 
@@ -34,6 +39,12 @@ On Colab:
 
 ```bash
 !python run_all.py
+```
+
+Open directly in Colab:
+
+```text
+https://colab.research.google.com/github/snowballTQ/clean-backtest/blob/main/clean_backtest_colab.ipynb
 ```
 
 Run only the core comparison:
