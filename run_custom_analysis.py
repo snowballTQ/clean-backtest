@@ -7,6 +7,9 @@ from datetime import datetime
 import backtest as bt
 
 
+VALID_BASE_SERIES = {"ndx", "spx", "composite_splice"}
+
+
 def parse_date(value: str):
     return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -21,27 +24,64 @@ def parse_float_list(value: str) -> list[float]:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def parse_name_list(value: str, valid_choices: set[str]) -> list[str]:
+    parts = [item.strip() for item in value.split(",") if item.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("Expected a comma-separated list of names.")
+    invalid = [item for item in parts if item not in valid_choices]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"Unsupported names: {', '.join(invalid)}. Valid choices: {', '.join(sorted(valid_choices))}."
+        )
+    deduped: list[str] = []
+    for item in parts:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run configurable backtests with custom date ranges, cost settings, and strategy options.",
+        description="Run a configurable backtest toolbox with multiple base series, leverage settings, and timing rules.",
     )
     parser.add_argument("--start-date", default=bt.DEFAULT_START_DATE.isoformat(), help="Backtest start date in YYYY-MM-DD format.")
     parser.add_argument("--end-date", default=bt.DEFAULT_END_DATE.isoformat(), help="Backtest end date in YYYY-MM-DD format.")
-    parser.add_argument("--base-series", choices=["ndx", "composite_splice"], default="ndx", help="Underlying index history to use.")
-    parser.add_argument("--leverages", default="2,3", help="Comma-separated leverage values such as 1,2,3.")
+    parser.add_argument(
+        "--base-series",
+        default="ndx",
+        help="Comma-separated base series such as ndx, spx, composite_splice.",
+    )
+    parser.add_argument("--leverages", default="2,3", help="Comma-separated leverage values such as 2,3.")
+    parser.add_argument(
+        "--include-base-series",
+        dest="include_base_series",
+        action="store_true",
+        default=True,
+        help="Include 1x base-series strategies in the output.",
+    )
+    parser.add_argument(
+        "--skip-base-series",
+        dest="include_base_series",
+        action="store_false",
+        help="Skip 1x base-series strategies.",
+    )
     parser.add_argument("--include-zero-cost", action="store_true", help="Include zero-cost leveraged series.")
     parser.add_argument("--skip-cost-adjusted", action="store_true", help="Skip cost-adjusted leveraged series.")
     parser.add_argument("--skip-buyhold", action="store_true", help="Skip buy-and-hold strategies.")
-    parser.add_argument("--skip-timing", action="store_true", help="Skip moving-average timing strategies.")
-    parser.add_argument("--include-staged", action="store_true", help="Include staged exit strategies.")
-    parser.add_argument("--sma-window", type=int, default=bt.SMA_WINDOW, help="Moving average window length.")
-    parser.add_argument("--entry-confirm-days", type=int, default=bt.ENTRY_CONFIRM_DAYS, help="Number of consecutive closes above the moving average before entry.")
+    parser.add_argument("--skip-price-sma", action="store_true", help="Skip price-vs-SMA timing strategies.")
+    parser.add_argument("--skip-dual-sma", action="store_true", help="Skip fast/slow SMA crossover strategies.")
+    parser.add_argument("--skip-timing", action="store_true", help="Backward-compatible alias for --skip-price-sma.")
+    parser.add_argument("--price-sma-window", type=int, default=200, help="Moving average window length for the price-vs-SMA strategy.")
+    parser.add_argument("--price-entry-confirm-days", type=int, default=3, help="Consecutive closes above the SMA before entry.")
+    parser.add_argument("--price-exit-confirm-days", type=int, default=1, help="Consecutive closes below the SMA before exit.")
+    parser.add_argument("--fast-sma-window", type=int, default=50, help="Fast moving average window for the crossover strategy.")
+    parser.add_argument("--slow-sma-window", type=int, default=200, help="Slow moving average window for the crossover strategy.")
+    parser.add_argument("--cross-entry-confirm-days", type=int, default=1, help="Consecutive fast-over-slow signals before entry.")
+    parser.add_argument("--cross-exit-confirm-days", type=int, default=1, help="Consecutive fast-under-slow signals before exit.")
     parser.add_argument("--commission-rate", type=float, default=bt.COMMISSION_RATE, help="Commission per side as a decimal.")
     parser.add_argument("--tax-rate", type=float, default=bt.TAX_RATE, help="Tax rate on net realized gains by calendar year.")
     parser.add_argument("--expense-ratio", type=float, default=bt.EXPENSE_RATIO, help="Annual expense ratio as a decimal.")
     parser.add_argument("--borrow-spread", type=float, default=bt.BORROW_SPREAD, help="Borrow spread added to DFF, in percentage points.")
-    parser.add_argument("--small-exit-thresholds", default="1.10,1.25,1.50", help="Comma-separated thresholds for partial exits.")
-    parser.add_argument("--large-exit-start", type=float, default=bt.LARGE_EXIT_START, help="Starting threshold for large staged exits.")
     parser.add_argument("--output-name", default="custom_analysis", help="Name of the output folder created under the output root.")
     return parser
 
@@ -51,151 +91,239 @@ def apply_runtime_settings(args) -> None:
     bt.TAX_RATE = args.tax_rate
     bt.EXPENSE_RATIO = args.expense_ratio
     bt.BORROW_SPREAD = args.borrow_spread
-    bt.SMA_WINDOW = args.sma_window
-    bt.ENTRY_CONFIRM_DAYS = args.entry_confirm_days
-    bt.SMALL_EXIT_THRESHOLDS = parse_float_list(args.small_exit_thresholds)
-    bt.LARGE_EXIT_START = args.large_exit_start
+
+
+def add_strategy_result(
+    metric_rows: list[bt.MetricRow],
+    annual_by_strategy: dict[str, list[dict[str, object]]],
+    drawdowns_by_strategy: dict[str, list[bt.DrawdownEpisode]],
+    curves_by_strategy: dict[str, list[tuple[object, float]]],
+    metrics: bt.MetricRow,
+    curve: list[tuple[object, float]],
+) -> None:
+    metric_rows.append(metrics)
+    annual_by_strategy[metrics.name] = bt.compute_calendar_year_returns(curve)
+    drawdowns_by_strategy[metrics.name] = bt.compute_drawdown_episodes(metrics.name, curve)
+    curves_by_strategy[metrics.name] = curve
+
+
+def add_buyhold_and_timing_results(
+    *,
+    series: list[tuple[object, float]],
+    rate_dates: list[object],
+    rate_map: dict[object, float],
+    label_prefix: str,
+    include_buyhold: bool,
+    include_price_sma: bool,
+    include_dual_sma: bool,
+    price_sma_window: int,
+    price_entry_confirm_days: int,
+    price_exit_confirm_days: int,
+    fast_sma_window: int,
+    slow_sma_window: int,
+    cross_entry_confirm_days: int,
+    cross_exit_confirm_days: int,
+    metric_rows: list[bt.MetricRow],
+    annual_by_strategy: dict[str, list[dict[str, object]]],
+    drawdowns_by_strategy: dict[str, list[bt.DrawdownEpisode]],
+    curves_by_strategy: dict[str, list[tuple[object, float]]],
+) -> None:
+    if include_buyhold:
+        metrics, curve = bt.simulate_buy_and_hold(series)
+        metrics.name = f"Buy and Hold | {label_prefix}"
+        add_strategy_result(metric_rows, annual_by_strategy, drawdowns_by_strategy, curves_by_strategy, metrics, curve)
+
+    if include_price_sma:
+        metrics, curve = bt.simulate_price_vs_sma_timing(
+            series=series,
+            rate_dates=rate_dates,
+            rate_map=rate_map,
+            strategy_name=(
+                f"Price vs SMA | {label_prefix} | "
+                f"sma={price_sma_window} | in={price_entry_confirm_days} | out={price_exit_confirm_days}"
+            ),
+            sma_window=price_sma_window,
+            entry_confirm_days=price_entry_confirm_days,
+            exit_confirm_days=price_exit_confirm_days,
+        )
+        add_strategy_result(metric_rows, annual_by_strategy, drawdowns_by_strategy, curves_by_strategy, metrics, curve)
+
+    if include_dual_sma:
+        metrics, curve = bt.simulate_dual_sma_timing(
+            series=series,
+            rate_dates=rate_dates,
+            rate_map=rate_map,
+            strategy_name=(
+                f"Dual SMA | {label_prefix} | "
+                f"fast={fast_sma_window} | slow={slow_sma_window} | "
+                f"in={cross_entry_confirm_days} | out={cross_exit_confirm_days}"
+            ),
+            fast_window=fast_sma_window,
+            slow_window=slow_sma_window,
+            entry_confirm_days=cross_entry_confirm_days,
+            exit_confirm_days=cross_exit_confirm_days,
+        )
+        add_strategy_result(metric_rows, annual_by_strategy, drawdowns_by_strategy, curves_by_strategy, metrics, curve)
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
     start_date = parse_date(args.start_date)
     end_date = parse_date(args.end_date)
     if start_date >= end_date:
         raise ValueError("start-date must be earlier than end-date.")
 
-    apply_runtime_settings(args)
+    base_series_names = parse_name_list(args.base_series, VALID_BASE_SERIES)
     leverage_values = parse_float_list(args.leverages)
+    include_buyhold = not args.skip_buyhold
+    include_price_sma = not (args.skip_price_sma or args.skip_timing)
+    include_dual_sma = not args.skip_dual_sma
+    include_cost_adjusted = not args.skip_cost_adjusted
+    include_zero_cost = args.include_zero_cost
 
-    index_rows = bt.load_index_rows(start_date, end_date)
+    if not include_zero_cost and not include_cost_adjusted:
+        raise ValueError("At least one of zero-cost or cost-adjusted series must be enabled.")
+    if not include_buyhold and not include_price_sma and not include_dual_sma:
+        raise ValueError("At least one strategy family must be enabled.")
+
+    apply_runtime_settings(args)
+
     rate_rows = bt.load_rate_rows(None, end_date)
     rate_dates = [row_date for row_date, _ in rate_rows]
     rate_map = dict(rate_rows)
-    proxy_rows = bt.load_proxy_rows(start_date, end_date)
-    proxy_dates = [row_date for row_date, _ in proxy_rows]
-    proxy_map = dict(proxy_rows)
-
-    if args.base_series == "composite_splice":
-        composite_rows = bt.load_composite_rows(None, end_date)
-        base_rows = bt.build_spliced_series(composite_rows, index_rows, start_date)
-    else:
-        base_rows = index_rows
-
-    include_cost_adjusted = not args.skip_cost_adjusted
-    include_zero_cost = args.include_zero_cost
-    if not include_zero_cost and not include_cost_adjusted:
-        raise ValueError("At least one of zero-cost or cost-adjusted series must be enabled.")
 
     output_dir = bt.ensure_output_dir(args.output_name)
     metrics_path = output_dir / "metrics.csv"
     annual_path = output_dir / "annual_returns.csv"
     drawdowns_path = output_dir / "drawdowns.csv"
+    curves_path = output_dir / "equity_curves.csv"
     config_path = output_dir / "config.json"
 
-    metric_rows = []
-    annual_by_strategy = {}
-    drawdowns_by_strategy = {}
+    metric_rows: list[bt.MetricRow] = []
+    annual_by_strategy: dict[str, list[dict[str, object]]] = {}
+    drawdowns_by_strategy: dict[str, list[bt.DrawdownEpisode]] = {}
+    curves_by_strategy: dict[str, list[tuple[object, float]]] = {}
 
-    if 1.0 in leverage_values and not args.skip_buyhold:
-        normalized_base = [(row_date, price / base_rows[0][1]) for row_date, price in base_rows]
-        ndx_metrics, ndx_curve = bt.simulate_buy_and_hold(normalized_base)
-        ndx_metrics.name = f"Index Buy and Hold | base={args.base_series}"
-        metric_rows.append(ndx_metrics)
-        annual_by_strategy[ndx_metrics.name] = bt.compute_calendar_year_returns(ndx_curve)
-        drawdowns_by_strategy[ndx_metrics.name] = bt.compute_drawdown_episodes(ndx_metrics.name, ndx_curve)
+    for base_series_name in base_series_names:
+        base_rows = bt.resolve_base_rows(base_series_name, start_date, end_date)
+        normalized_base = bt.normalize_series(base_rows)
 
-    for leverage in leverage_values:
-        if leverage == 1.0:
-            continue
+        if args.include_base_series:
+            add_buyhold_and_timing_results(
+                series=normalized_base,
+                rate_dates=rate_dates,
+                rate_map=rate_map,
+                label_prefix=f"1.00x | base={base_series_name}",
+                include_buyhold=include_buyhold,
+                include_price_sma=include_price_sma,
+                include_dual_sma=include_dual_sma,
+                price_sma_window=args.price_sma_window,
+                price_entry_confirm_days=args.price_entry_confirm_days,
+                price_exit_confirm_days=args.price_exit_confirm_days,
+                fast_sma_window=args.fast_sma_window,
+                slow_sma_window=args.slow_sma_window,
+                cross_entry_confirm_days=args.cross_entry_confirm_days,
+                cross_exit_confirm_days=args.cross_exit_confirm_days,
+                metric_rows=metric_rows,
+                annual_by_strategy=annual_by_strategy,
+                drawdowns_by_strategy=drawdowns_by_strategy,
+                curves_by_strategy=curves_by_strategy,
+            )
 
-        if include_zero_cost:
-            zero_series = bt.build_leveraged_series(base_rows, rate_dates, rate_map, leverage=leverage, include_financing_cost=False)
-            if not args.skip_buyhold:
-                metrics, curve = bt.simulate_buy_and_hold(zero_series)
-                metrics.name = f"Buy and Hold | {leverage:.2f}x | zero cost | base={args.base_series}"
-                metric_rows.append(metrics)
-                annual_by_strategy[metrics.name] = bt.compute_calendar_year_returns(curve)
-                drawdowns_by_strategy[metrics.name] = bt.compute_drawdown_episodes(metrics.name, curve)
-            if not args.skip_timing:
-                metrics, curve = bt.simulate_three_day_timing(
-                    zero_series,
+        for leverage in leverage_values:
+            if leverage <= 1.0:
+                continue
+
+            if include_zero_cost:
+                zero_series = bt.build_leveraged_series(
+                    base_rows,
                     rate_dates,
                     rate_map,
-                    strategy_name=f"Timing | {leverage:.2f}x | zero cost | base={args.base_series}",
+                    leverage=leverage,
+                    include_financing_cost=False,
                 )
-                metric_rows.append(metrics)
-                annual_by_strategy[metrics.name] = bt.compute_calendar_year_returns(curve)
-                drawdowns_by_strategy[metrics.name] = bt.compute_drawdown_episodes(metrics.name, curve)
-            if args.include_staged:
-                result = bt.simulate_staged_strategy(
-                    zero_series,
-                    rate_dates,
-                    rate_map,
-                    proxy_dates,
-                    proxy_map,
-                    strategy_name=f"Staged | {leverage:.2f}x | zero cost | base={args.base_series}",
+                add_buyhold_and_timing_results(
+                    series=zero_series,
+                    rate_dates=rate_dates,
+                    rate_map=rate_map,
+                    label_prefix=f"{leverage:.2f}x | zero cost | base={base_series_name}",
+                    include_buyhold=include_buyhold,
+                    include_price_sma=include_price_sma,
+                    include_dual_sma=include_dual_sma,
+                    price_sma_window=args.price_sma_window,
+                    price_entry_confirm_days=args.price_entry_confirm_days,
+                    price_exit_confirm_days=args.price_exit_confirm_days,
+                    fast_sma_window=args.fast_sma_window,
+                    slow_sma_window=args.slow_sma_window,
+                    cross_entry_confirm_days=args.cross_entry_confirm_days,
+                    cross_exit_confirm_days=args.cross_exit_confirm_days,
+                    metric_rows=metric_rows,
+                    annual_by_strategy=annual_by_strategy,
+                    drawdowns_by_strategy=drawdowns_by_strategy,
+                    curves_by_strategy=curves_by_strategy,
                 )
-                metric_rows.append(result["metrics"])
-                annual_by_strategy[result["metrics"].name] = result["annual_rows"]
-                drawdowns_by_strategy[result["metrics"].name] = result["drawdowns"]
 
-        if include_cost_adjusted:
-            cost_series = bt.build_leveraged_series(base_rows, rate_dates, rate_map, leverage=leverage, include_financing_cost=True)
-            if not args.skip_buyhold:
-                metrics, curve = bt.simulate_buy_and_hold(cost_series)
-                metrics.name = f"Buy and Hold | {leverage:.2f}x | cost-adjusted | base={args.base_series}"
-                metric_rows.append(metrics)
-                annual_by_strategy[metrics.name] = bt.compute_calendar_year_returns(curve)
-                drawdowns_by_strategy[metrics.name] = bt.compute_drawdown_episodes(metrics.name, curve)
-            if not args.skip_timing:
-                metrics, curve = bt.simulate_three_day_timing(
-                    cost_series,
+            if include_cost_adjusted:
+                cost_series = bt.build_leveraged_series(
+                    base_rows,
                     rate_dates,
                     rate_map,
-                    strategy_name=f"Timing | {leverage:.2f}x | cost-adjusted | base={args.base_series}",
+                    leverage=leverage,
+                    include_financing_cost=True,
                 )
-                metric_rows.append(metrics)
-                annual_by_strategy[metrics.name] = bt.compute_calendar_year_returns(curve)
-                drawdowns_by_strategy[metrics.name] = bt.compute_drawdown_episodes(metrics.name, curve)
-            if args.include_staged:
-                result = bt.simulate_staged_strategy(
-                    cost_series,
-                    rate_dates,
-                    rate_map,
-                    proxy_dates,
-                    proxy_map,
-                    strategy_name=f"Staged | {leverage:.2f}x | cost-adjusted | base={args.base_series}",
+                add_buyhold_and_timing_results(
+                    series=cost_series,
+                    rate_dates=rate_dates,
+                    rate_map=rate_map,
+                    label_prefix=f"{leverage:.2f}x | cost-adjusted | base={base_series_name}",
+                    include_buyhold=include_buyhold,
+                    include_price_sma=include_price_sma,
+                    include_dual_sma=include_dual_sma,
+                    price_sma_window=args.price_sma_window,
+                    price_entry_confirm_days=args.price_entry_confirm_days,
+                    price_exit_confirm_days=args.price_exit_confirm_days,
+                    fast_sma_window=args.fast_sma_window,
+                    slow_sma_window=args.slow_sma_window,
+                    cross_entry_confirm_days=args.cross_entry_confirm_days,
+                    cross_exit_confirm_days=args.cross_exit_confirm_days,
+                    metric_rows=metric_rows,
+                    annual_by_strategy=annual_by_strategy,
+                    drawdowns_by_strategy=drawdowns_by_strategy,
+                    curves_by_strategy=curves_by_strategy,
                 )
-                metric_rows.append(result["metrics"])
-                annual_by_strategy[result["metrics"].name] = result["annual_rows"]
-                drawdowns_by_strategy[result["metrics"].name] = result["drawdowns"]
 
     if not metric_rows:
-        raise ValueError("No strategies were selected. Adjust the flags and try again.")
+        raise ValueError("No strategies were selected. Adjust the options and try again.")
 
     bt.write_metrics_csv(metrics_path, metric_rows)
     bt.write_annual_returns_csv(annual_path, annual_by_strategy)
     bt.write_drawdowns_csv(drawdowns_path, drawdowns_by_strategy)
+    bt.write_equity_curves_csv(curves_path, curves_by_strategy)
 
     config = {
         "start_date": args.start_date,
         "end_date": args.end_date,
-        "base_series": args.base_series,
+        "base_series": base_series_names,
         "leverages": leverage_values,
+        "include_base_series": args.include_base_series,
         "include_zero_cost": include_zero_cost,
         "include_cost_adjusted": include_cost_adjusted,
-        "include_buyhold": not args.skip_buyhold,
-        "include_timing": not args.skip_timing,
-        "include_staged": args.include_staged,
-        "sma_window": bt.SMA_WINDOW,
-        "entry_confirm_days": bt.ENTRY_CONFIRM_DAYS,
+        "include_buyhold": include_buyhold,
+        "include_price_sma": include_price_sma,
+        "include_dual_sma": include_dual_sma,
+        "price_sma_window": args.price_sma_window,
+        "price_entry_confirm_days": args.price_entry_confirm_days,
+        "price_exit_confirm_days": args.price_exit_confirm_days,
+        "fast_sma_window": args.fast_sma_window,
+        "slow_sma_window": args.slow_sma_window,
+        "cross_entry_confirm_days": args.cross_entry_confirm_days,
+        "cross_exit_confirm_days": args.cross_exit_confirm_days,
         "commission_rate": bt.COMMISSION_RATE,
         "tax_rate": bt.TAX_RATE,
         "expense_ratio": bt.EXPENSE_RATIO,
         "borrow_spread": bt.BORROW_SPREAD,
-        "small_exit_thresholds": bt.SMALL_EXIT_THRESHOLDS,
-        "large_exit_start": bt.LARGE_EXIT_START,
         "output_directory": str(output_dir),
     }
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -203,6 +331,7 @@ def main() -> None:
     print(f"wrote {metrics_path}")
     print(f"wrote {annual_path}")
     print(f"wrote {drawdowns_path}")
+    print(f"wrote {curves_path}")
     print(f"wrote {config_path}")
     for row in metric_rows:
         print(

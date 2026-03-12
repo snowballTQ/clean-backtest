@@ -161,6 +161,10 @@ def load_proxy_rows(start_date: date, end_date: date) -> list[tuple[date, float]
     return parse_stooq_csv(raw_text, start_date, end_date)
 
 
+def load_spx_rows(start_date: date, end_date: date) -> list[tuple[date, float]]:
+    return load_proxy_rows(start_date, end_date)
+
+
 def load_rate_rows(start_date: date | None = None, end_date: date | None = None) -> list[tuple[date, float]]:
     raw_text = read_snapshot_or_fetch(["dff.csv", "dff.txt"], DFF_TEXT_URL)
     return parse_fred_series(raw_text, "DFF", start_date, end_date)
@@ -169,6 +173,28 @@ def load_rate_rows(start_date: date | None = None, end_date: date | None = None)
 def load_composite_rows(start_date: date | None = None, end_date: date | None = None) -> list[tuple[date, float]]:
     raw_text = read_snapshot_or_fetch(["nasdaqcom.csv", "nasdaqcom.txt"], NASDAQ_COMPOSITE_TEXT_URL)
     return parse_fred_series(raw_text, "NASDAQCOM", start_date, end_date)
+
+
+def resolve_base_rows(
+    base_series_name: str,
+    start_date: date,
+    end_date: date,
+) -> list[tuple[date, float]]:
+    if base_series_name == "ndx":
+        return load_index_rows(start_date, end_date)
+    if base_series_name == "spx":
+        return load_spx_rows(start_date, end_date)
+    if base_series_name == "composite_splice":
+        later_rows = load_index_rows(start_date, end_date)
+        early_rows = load_composite_rows(None, end_date)
+        splice_date = later_rows[0][0]
+        return build_spliced_series(early_rows, later_rows, splice_date)
+    raise ValueError(f"Unsupported base series: {base_series_name}")
+
+
+def normalize_series(series: list[tuple[date, float]]) -> list[tuple[date, float]]:
+    first_price = series[0][1]
+    return [(row_date, price / first_price) for row_date, price in series]
 
 
 def get_latest_value(target_date: date, series_dates: list[date], series_map: dict[date, float]) -> float:
@@ -180,7 +206,8 @@ def get_latest_value(target_date: date, series_dates: list[date], series_map: di
 
 def annual_financing_rate(dff_percent: float, leverage: float) -> float:
     borrow_multiple = max(leverage - 1.0, 0.0)
-    return borrow_multiple * ((dff_percent + BORROW_SPREAD) / 100.0) + EXPENSE_RATIO
+    expense_ratio = EXPENSE_RATIO if leverage > 1.0 else 0.0
+    return borrow_multiple * ((dff_percent + BORROW_SPREAD) / 100.0) + expense_ratio
 
 
 def interval_cash_multiplier(days: int, dff_percent: float) -> float:
@@ -236,6 +263,14 @@ def rolling_sma(series: list[tuple[date, float]], window: int) -> list[float | N
             running_sum -= values[idx - window]
         output.append(running_sum / window if idx + 1 >= window else None)
     return output
+
+
+def has_consecutive_signal(flags: list[bool], idx: int, count: int) -> bool:
+    if count <= 0:
+        raise ValueError("Signal confirmation count must be at least 1.")
+    if idx < count - 1:
+        return False
+    return all(flags[idx - offset] for offset in range(count))
 
 
 def calculate_drawdown(values: list[float]) -> float:
@@ -388,8 +423,34 @@ def simulate_three_day_timing(
     rate_map: dict[date, float],
     strategy_name: str,
 ) -> tuple[MetricRow, list[tuple[date, float]]]:
-    sma = rolling_sma(series, SMA_WINDOW)
+    return simulate_price_vs_sma_timing(
+        series=series,
+        rate_dates=rate_dates,
+        rate_map=rate_map,
+        strategy_name=strategy_name,
+        sma_window=SMA_WINDOW,
+        entry_confirm_days=ENTRY_CONFIRM_DAYS,
+        exit_confirm_days=1,
+    )
+
+
+def simulate_price_vs_sma_timing(
+    series: list[tuple[date, float]],
+    rate_dates: list[date],
+    rate_map: dict[date, float],
+    strategy_name: str,
+    sma_window: int,
+    entry_confirm_days: int,
+    exit_confirm_days: int,
+) -> tuple[MetricRow, list[tuple[date, float]]]:
+    if sma_window < 1:
+        raise ValueError("sma_window must be at least 1.")
+    if entry_confirm_days < 1 or exit_confirm_days < 1:
+        raise ValueError("entry_confirm_days and exit_confirm_days must be at least 1.")
+
+    sma = rolling_sma(series, sma_window)
     above = [value is not None and price > value for (_, price), value in zip(series, sma, strict=True)]
+    below = [value is not None and price < value for (_, price), value in zip(series, sma, strict=True)]
 
     cash = 1.0
     shares = 0.0
@@ -423,7 +484,8 @@ def simulate_three_day_timing(
                     cash -= tax
             realized_by_year.setdefault(current_date.year, 0.0)
 
-        if in_asset and sma[idx] is not None and current_price < sma[idx]:
+        can_exit = in_asset and has_consecutive_signal(below, idx, exit_confirm_days)
+        if can_exit:
             gross_sale = shares * current_price
             net_sale = gross_sale * (1.0 - COMMISSION_RATE)
             realized = net_sale - basis
@@ -434,11 +496,107 @@ def simulate_three_day_timing(
             in_asset = False
             trades += 1
 
-        can_enter = (
-            not in_asset
-            and idx >= ENTRY_CONFIRM_DAYS - 1
-            and all(above[idx - offset] for offset in range(ENTRY_CONFIRM_DAYS))
-        )
+        can_enter = not in_asset and has_consecutive_signal(above, idx, entry_confirm_days)
+        if can_enter:
+            gross_purchase = cash / (1.0 + COMMISSION_RATE)
+            shares = gross_purchase / current_price
+            basis = cash
+            cash = 0.0
+            in_asset = True
+            trades += 1
+
+        equity_curve.append((current_date, shares * current_price if in_asset else cash))
+
+    last_date, last_price = series[-1]
+    if in_asset:
+        gross_sale = shares * last_price
+        net_sale = gross_sale * (1.0 - COMMISSION_RATE)
+        realized = net_sale - basis
+        realized_by_year[last_date.year] = realized_by_year.get(last_date.year, 0.0) + realized
+        cash = net_sale
+        trades += 1
+
+    final_tax = max(realized_by_year.get(last_date.year, 0.0), 0.0) * TAX_RATE
+    final_value = cash - final_tax
+    total_days = (series[-1][0] - series[0][0]).days
+    time_in_market = days_in_asset / total_days if total_days > 0 else 0.0
+    metrics = compute_summary_stats(strategy_name, equity_curve, final_value, trades, time_in_market)
+    return metrics, equity_curve
+
+
+def simulate_dual_sma_timing(
+    series: list[tuple[date, float]],
+    rate_dates: list[date],
+    rate_map: dict[date, float],
+    strategy_name: str,
+    fast_window: int,
+    slow_window: int,
+    entry_confirm_days: int,
+    exit_confirm_days: int,
+) -> tuple[MetricRow, list[tuple[date, float]]]:
+    if fast_window < 1 or slow_window < 1:
+        raise ValueError("Moving average windows must be at least 1.")
+    if fast_window >= slow_window:
+        raise ValueError("fast_window must be smaller than slow_window.")
+    if entry_confirm_days < 1 or exit_confirm_days < 1:
+        raise ValueError("entry_confirm_days and exit_confirm_days must be at least 1.")
+
+    fast_sma = rolling_sma(series, fast_window)
+    slow_sma = rolling_sma(series, slow_window)
+    bullish = [
+        fast is not None and slow is not None and fast > slow
+        for fast, slow in zip(fast_sma, slow_sma, strict=True)
+    ]
+    bearish = [
+        fast is not None and slow is not None and fast < slow
+        for fast, slow in zip(fast_sma, slow_sma, strict=True)
+    ]
+
+    cash = 1.0
+    shares = 0.0
+    basis = 0.0
+    in_asset = False
+    trades = 0
+    days_in_asset = 0
+    realized_by_year: dict[int, float] = {}
+    equity_curve: list[tuple[date, float]] = [(series[0][0], 1.0)]
+
+    for idx in range(1, len(series)):
+        prev_date, _ = series[idx - 1]
+        current_date, current_price = series[idx]
+        days = (current_date - prev_date).days
+
+        if in_asset:
+            days_in_asset += days
+        else:
+            rate = get_latest_value(prev_date, rate_dates, rate_map)
+            cash *= interval_cash_multiplier(days, rate)
+
+        if current_date.year != prev_date.year:
+            tax = max(realized_by_year.get(prev_date.year, 0.0), 0.0) * TAX_RATE
+            if tax > 0.0:
+                if in_asset:
+                    portfolio_value = shares * current_price
+                    ratio = max((portfolio_value - tax) / portfolio_value, 0.0)
+                    shares *= ratio
+                    basis *= ratio
+                else:
+                    cash -= tax
+            realized_by_year.setdefault(current_date.year, 0.0)
+
+        can_exit = in_asset and has_consecutive_signal(bearish, idx, exit_confirm_days)
+        if can_exit:
+            gross_sale = shares * current_price
+            net_sale = gross_sale * (1.0 - COMMISSION_RATE)
+            realized = net_sale - basis
+            realized_by_year[current_date.year] = realized_by_year.get(current_date.year, 0.0) + realized
+            cash = net_sale
+            shares = 0.0
+            basis = 0.0
+            in_asset = False
+            trades += 1
+
+        can_enter = not in_asset and has_consecutive_signal(bullish, idx, entry_confirm_days)
         if can_enter:
             gross_purchase = cash / (1.0 + COMMISSION_RATE)
             shares = gross_purchase / current_price
@@ -702,6 +860,15 @@ def write_drawdowns_csv(path: Path, drawdowns_by_strategy: dict[str, list[Drawdo
                         int(episode.recovered),
                     ]
                 )
+
+
+def write_equity_curves_csv(path: Path, curves_by_strategy: dict[str, list[tuple[date, float]]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["strategy", "date", "equity"])
+        for strategy, curve in curves_by_strategy.items():
+            for row_date, value in curve:
+                writer.writerow([strategy, row_date.isoformat(), f"{value:.6f}"])
 
 
 def write_rows_csv(path: Path, rows: list[dict[str, object]]) -> None:
